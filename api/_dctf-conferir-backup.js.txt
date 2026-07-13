@@ -1,0 +1,87 @@
+// api/dctf-conferir.js — cruza UMA guia DCTF/DCTFWeb com os prestadores da planilha da competência.
+export const config = { maxDuration: 60 };
+
+// Extrai JSON mesmo que a IA responda com texto em volta.
+function extrairJSON(texto) {
+  const limpo = String(texto || "").replace(/```json|```/g, "").trim();
+  try { return JSON.parse(limpo); } catch {}
+  const ini = limpo.indexOf("{");
+  const fim = limpo.lastIndexOf("}");
+  if (ini >= 0 && fim > ini) {
+    try { return JSON.parse(limpo.slice(ini, fim + 1)); } catch {}
+  }
+  return null;
+}
+
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido" });
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY não configurada na Vercel." });
+
+  try {
+    const { guia, competencia, condominios } = req.body;
+    if (!guia || !guia.data) return res.status(400).json({ error: "Nenhuma guia enviada." });
+    if (!Array.isArray(condominios) || condominios.length === 0) return res.status(400).json({ error: "Sem condomínios da planilha." });
+
+    const tabela = condominios.map((c) =>
+      `- ${c.condominio}${c.cnpj ? ` (CNPJ ${c.cnpj})` : ""} [${c.qtd_prestadores} prestador(es)]: INSS=${c.totais.INSS}, PIS=${c.totais.PIS}, COFINS=${c.totais.COFINS}, IRRF=${c.totais.IRRF}, CSLL=${c.totais.CSLL}`
+    ).join("\n");
+
+    const instrucoes = `Você é um analista fiscal da Attento conferindo a DCTF da competência ${competencia}. Recebeu UMA guia (PDF) de imposto — pode ser DARF, DCTFWeb ou guia de retenção — anexada acima.
+
+PLANILHA — TOTAIS POR CONDOMÍNIO (já somados). Na planilha os valores vêm desmembrados por prestador; aqui já estão SOMADOS por condomínio, porque na guia o valor lançado é o TOTAL por código:
+${tabela}
+
+TAREFA:
+1. Identifique a qual CONDOMÍNIO esta guia se refere (nome, CNPJ, tomador). Case com um dos condomínios da lista acima.
+2. Extraia da guia os valores de cada imposto: INSS, PIS, COFINS, IRRF, CSLL (e o total geral).
+3. Compare o valor de cada imposto NA GUIA com o TOTAL SOMADO do condomínio na planilha.
+4. Para cada imposto: "ok" se bate, "divergente" se difere, "ausente" se está numa fonte e não na outra.
+
+Para CADA imposto, preencha "detalhe" com UMA FRASE explicando o resultado, deixando claro que o valor da planilha é a SOMA do condomínio. Exemplos: "INSS: guia R$ 5.955,81 confere com a soma do condomínio na planilha." / "IRRF diverge: soma da planilha R$ 583,76, guia R$ 500,00 (diferença R$ 83,76)." / "PIS somado na planilha (R$ 420,35) não encontrado na guia."
+
+Se não conseguir casar a guia com nenhum condomínio, NÃO escreva texto explicativo: responda mesmo assim o JSON no formato abaixo, com "condominio_detectado" preenchido com o que leu na guia (ou null), a explicação em "observacao", e a "comparacao" com os valores lidos da guia e "valor_planilha": null e status "pendencia".
+Se o PDF estiver ilegível ou for imagem sem texto, também responda o JSON, com "observacao" explicando isso e "comparacao": [].
+
+REGRA ABSOLUTA DE FORMATO: sua resposta deve começar com "{" e terminar com "}". Nada antes, nada depois. Sem markdown, sem crases, sem comentários.
+
+Responda APENAS com JSON válido, sem markdown:
+{
+  "condominio_detectado": "nome que casou na planilha, ou o que leu na guia",
+  "cnpj_detectado": "... ou null",
+  "observacao": "resumo curto do que conferiu / avisos",
+  "comparacao": [
+    { "imposto": "INSS", "valor_planilha": "0,00", "valor_guia": "0,00", "status": "ok|divergente|ausente|pendencia", "detalhe": "frase" },
+    { "imposto": "PIS", "valor_planilha": "...", "valor_guia": "...", "status": "...", "detalhe": "..." },
+    { "imposto": "COFINS", "valor_planilha": "...", "valor_guia": "...", "status": "...", "detalhe": "..." },
+    { "imposto": "IRRF", "valor_planilha": "...", "valor_guia": "...", "status": "...", "detalhe": "..." },
+    { "imposto": "CSLL", "valor_planilha": "...", "valor_guia": "...", "status": "...", "detalhe": "..." }
+  ]
+}`;
+
+    const content = [
+      { type: "document", source: { type: "base64", media_type: "application/pdf", data: guia.data }, title: guia.nome || "Guia" },
+      { type: "text", text: instrucoes },
+    ];
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 2000, messages: [{ role: "user", content }] }),
+    });
+    if (!r.ok) return res.status(r.status).json({ error: "Erro na API Anthropic", detalhe: await r.text() });
+
+    const data = await r.json();
+    const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").replace(/```json|```/g, "").trim();
+    const parsed = extrairJSON(texto);
+    if (!parsed) {
+      const resumo = String(texto || "").slice(0, 400);
+      return res.status(502).json({ error: `A IA não retornou JSON. Ela respondeu: ${resumo}` });
+    }
+    parsed._guia = guia.nome;
+    return res.status(200).json(parsed);
+  } catch (e) {
+    return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
+  }
+}
