@@ -1,0 +1,282 @@
+import React, { useState } from "react";
+import * as XLSX from "xlsx";
+
+const STATUS = {
+  ok: { cor: "#1f9d55", bg: "#e6f4ea", txt: "Confere" },
+  divergente: { cor: "#c0392b", bg: "#fdecea", txt: "Divergente" },
+  ausente: { cor: "#7a7a7a", bg: "#f0f0f0", txt: "Não achado" },
+  pendencia: { cor: "#b7791f", bg: "#fef5e7", txt: "Atenção" },
+};
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(",")[1]);
+    r.onerror = () => reject(new Error("Falha ao ler " + file.name));
+    r.readAsDataURL(file);
+  });
+}
+
+export default function TelaDCTF() {
+  const [planilha, setPlanilha] = useState(null); // { nome, abas: {aba: linhas} }
+  const [abaSel, setAbaSel] = useState("");
+  const [guias, setGuias] = useState([]);
+  const [carregando, setCarregando] = useState(false);
+  const [progresso, setProgresso] = useState(null);
+  const [resultado, setResultado] = useState(null);
+  const [erro, setErro] = useState(null);
+
+  async function lerPlanilha(file) {
+    setErro(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { cellDates: true });
+      const abas = {};
+      wb.SheetNames.forEach((nome) => {
+        abas[nome] = XLSX.utils.sheet_to_json(wb.Sheets[nome], { header: 1, defval: "" });
+      });
+      setPlanilha({ nome: file.name, abas });
+      // seleciona a última aba (competência mais recente) por padrão
+      setAbaSel(wb.SheetNames[wb.SheetNames.length - 1]);
+    } catch (e) {
+      setErro("Não consegui ler a planilha: " + String(e.message || e));
+    }
+  }
+
+  // Aceita PDF pelo mimetype OU pela extensão (o navegador nem sempre preenche f.type).
+  function ehPDF(f) {
+    return f.type === "application/pdf" || /\.pdf$/i.test(f.name || "");
+  }
+
+  function addGuias(lista) {
+    const todos = Array.from(lista);
+    const pdfs = todos.filter(ehPDF);
+    const ignorados = todos.filter((f) => !ehPDF(f));
+    if (ignorados.length) {
+      setErro(`Ignorado(s) por não ser(em) PDF: ${ignorados.map((f) => f.name).join(", ")}`);
+    } else {
+      setErro(null);
+    }
+    if (pdfs.length) setGuias((p) => [...p, ...pdfs]);
+  }
+
+  // Converte texto "1.234,56" em número.
+  function num(v) {
+    if (typeof v === "number") return v;
+    const s = String(v).replace(/\./g, "").replace(",", ".").replace(/[^0-9.-]/g, "");
+    const n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
+  }
+  // Formata número como "1.234,56".
+  function fmt(n) {
+    return n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  // Extrai a aba e AGRUPA POR CONDOMÍNIO, somando cada imposto das linhas
+  // desmembradas — porque na guia o valor lançado é o total por condomínio.
+  // Suporta os dois layouts da planilha:
+  //  - ANTIGO: linha de prestador começa com "PREST." na col A; condomínio na col B.
+  //  - NOVO: linha de condomínio traz "NOME CNPJ 00.000..." na col A e valores vazios;
+  //          linha de prestador tem col A vazia, prestador na col B, CNPJ na col C.
+  function condominiosDaAba() {
+    if (!planilha || !abaSel) return [];
+    const linhas = planilha.abas[abaSel] || [];
+    // acha o cabeçalho procurando por "CNPJ PRESTADOR" (existe nos dois formatos)
+    let hIdx = linhas.findIndex((l) => l.some((c) => String(c).toUpperCase().includes("CNPJ PRESTADOR")));
+    if (hIdx < 0) hIdx = 1;
+    const head = linhas[hIdx].map((c) => String(c).replace(/\s+/g, " ").trim().toUpperCase());
+    const col = (...alts) => {
+      for (const a of alts) {
+        const i = head.findIndex((h) => h.includes(a));
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+    const idx = {
+      prest: col("PRESTADOR") >= 0 ? col("PRESTADOR") : 1,
+      cnpjPrest: col("CNPJ PRESTADOR"),
+      nf: col("NOTA FISCAL"),
+      inss: col("VALOR INSS", "INSS"), pis: col("VALOR PIS", "PIS"),
+      cofins: col("VALOR COFINS", "COFINS"), irrf: col("VALOR IRRF", "IRRF"),
+      csll: col("VALOR CSLL", "CSLL"),
+    };
+
+    // separa nome e CNPJ quando vierem juntos ("ANITA CNPJ 06.084.740/0001-30")
+    const parseCond = (txt) => {
+      const t = String(txt || "").replace(/\s+/g, " ").trim();
+      const m = t.match(/(.*?)\s*(?:CNPJ)?\s*(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})\s*$/i);
+      if (m) return { nome: m[1].replace(/CNPJ$/i, "").trim(), cnpj: m[2] };
+      return { nome: t, cnpj: "" };
+    };
+
+    const temValor = (l) =>
+      [idx.inss, idx.pis, idx.cofins, idx.irrf, idx.csll].some((c) => c >= 0 && String(l[c] || "").trim() !== "" && num(l[c]) !== 0);
+
+    const grupos = {};
+    let cond = null; // { nome, cnpj }
+    for (let i = hIdx + 1; i < linhas.length; i++) {
+      const l = linhas[i];
+      const colA = String(l[0] || "").trim();
+      const colB = String(l[idx.prest] || "").trim();
+      const colCnpj = idx.cnpjPrest >= 0 ? String(l[idx.cnpjPrest] || "").trim() : "";
+
+      // FORMATO ANTIGO: linha de prestador marcada com "PREST."
+      const ehPrestAntigo = colA.toUpperCase() === "PREST.";
+      // FORMATO NOVO: col A vazia + tem prestador na col B + tem CNPJ do prestador
+      const ehPrestNovo = colA === "" && colB !== "" && colCnpj !== "";
+
+      if (ehPrestAntigo || ehPrestNovo) {
+        if (!cond) continue;
+        const chave = cond.nome;
+        if (!grupos[chave]) {
+          grupos[chave] = { condominio: cond.nome, cnpj: cond.cnpj, inss: 0, pis: 0, cofins: 0, irrf: 0, csll: 0, prestadores: [] };
+        }
+        const g = grupos[chave];
+        g.inss += num(l[idx.inss]); g.pis += num(l[idx.pis]); g.cofins += num(l[idx.cofins]);
+        g.irrf += num(l[idx.irrf]); g.csll += num(l[idx.csll]);
+        g.prestadores.push({ nome: colB, cnpj: colCnpj, nota: idx.nf >= 0 ? String(l[idx.nf] || "").trim() : "" });
+        continue;
+      }
+
+      // senão, se a col A tem texto e a linha não tem valores → é cabeçalho de condomínio
+      if (colA !== "" && !temValor(l)) {
+        cond = parseCond(colA);
+      } else if (colB !== "" && colA !== "" && !temValor(l)) {
+        // formato antigo: condomínio vinha na col B
+        cond = parseCond(colB);
+      }
+    }
+
+    return Object.values(grupos).map((g) => ({
+      condominio: g.condominio,
+      cnpj: g.cnpj || null,
+      qtd_prestadores: g.prestadores.length,
+      totais: { INSS: fmt(g.inss), PIS: fmt(g.pis), COFINS: fmt(g.cofins), IRRF: fmt(g.irrf), CSLL: fmt(g.csll) },
+      prestadores: g.prestadores,
+    }));
+  }
+
+  async function conferir() {
+    setErro(null); setResultado(null);
+    if (!planilha) { setErro("Envie a planilha DCTF primeiro."); return; }
+    if (guias.length === 0) { setErro("Envie ao menos uma guia."); return; }
+    const condominios = condominiosDaAba();
+    if (condominios.length === 0) { setErro("Não encontrei condomínios/prestadores na aba selecionada."); return; }
+
+    setCarregando(true);
+    const total = guias.length;
+    try {
+      const analises = [];
+      for (let i = 0; i < guias.length; i++) {
+        setProgresso({ feitos: i, total });
+        const g = guias[i];
+        const base64 = await fileToBase64(g);
+        const resp = await fetch("/api/dctf-conferir", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            guia: { nome: g.name, data: base64 },
+            competencia: abaSel,
+            condominios,
+          }),
+        });
+        const raw = await resp.text();
+        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${g.name}": ${raw.slice(0, 300)}`); }
+        if (!resp.ok) throw new Error(`Falha em "${g.name}": ${data.error || resp.status}`);
+        analises.push(data);
+      }
+      setResultado({ competencia: abaSel, itens: analises });
+    } catch (e) {
+      setErro(String(e.message || e));
+    } finally {
+      setCarregando(false); setProgresso(null);
+    }
+  }
+
+  const condominios = planilha ? condominiosDaAba() : [];
+
+  return (
+    <>
+      <h2 className="tela-titulo">Conferência de DCTF</h2>
+      <section className="card">
+        <div className="passo">
+          <span className="passo-n">1</span>
+          <div style={{ flex: 1 }}>
+            <strong>Planilha DCTF (a competência já vem nela)</strong>
+            <input type="file" accept=".xlsx,.xls,.csv" style={{ display: "block", marginTop: 8 }}
+              onChange={(e) => e.target.files[0] && lerPlanilha(e.target.files[0])} />
+            {planilha && (
+              <div className="aba-sel">
+                <label>Competência (aba):
+                  <select value={abaSel} onChange={(e) => setAbaSel(e.target.value)}>
+                    {Object.keys(planilha.abas).map((a) => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                </label>
+                <span className="muted">{condominios.length} condomínio(s) nesta competência</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="passo">
+          <span className="passo-n">2</span>
+          <div style={{ flex: 1 }}>
+            <strong>Guia(s) DCTF / DCTFWeb recebida(s)</strong>
+            <input type="file" accept=".pdf,application/pdf" multiple style={{ display: "block", marginTop: 8 }}
+              onChange={(e) => addGuias(e.target.files)} />
+            {guias.length > 0 && (
+              <ul className="filelist" style={{ marginTop: 10 }}>
+                {guias.map((f, i) => (
+                  <li key={i}><span className="fname">📄 {f.name}</span>
+                    <button className="rm" onClick={() => setGuias((p) => p.filter((_, x) => x !== i))}>remover</button></li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+
+        <button className="btn-primary" onClick={conferir} disabled={carregando}>
+          {carregando ? "Conferindo…" : "Conferir DCTF"}
+        </button>
+        {progresso && (
+          <div className="prog">
+            <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
+            <span>Conferindo guia {progresso.feitos + 1} de {progresso.total}…</span>
+          </div>
+        )}
+        {erro && <div className="erro">{erro}</div>}
+      </section>
+
+      {resultado && (
+        <section>
+          <div className="card">
+            <h3 style={{ marginTop: 0, color: "var(--navy)" }}>Resultado — competência {resultado.competencia}</h3>
+            {resultado.itens.map((it, gi) => (
+              <div key={gi} style={{ marginBottom: 18 }}>
+                <p><strong>{it.condominio_detectado || it._guia || "Guia"}</strong>{it.cnpj_detectado ? ` · CNPJ ${it.cnpj_detectado}` : ""}</p>
+                {it.observacao && <p className="muted">{it.observacao}</p>}
+                <table className="fiscal">
+                  <thead><tr><th>Imposto</th><th>Planilha</th><th>Guia</th><th>Status</th><th>Detalhe</th></tr></thead>
+                  <tbody>
+                    {(it.comparacao || []).map((c, i) => {
+                      const s = STATUS[c.status] || STATUS.pendencia;
+                      return (
+                        <tr key={i}>
+                          <td className="cod">{c.imposto}</td>
+                          <td className="num">{c.valor_planilha ?? "—"}</td>
+                          <td className="num">{c.valor_guia ?? "—"}</td>
+                          <td><span className="vbadge" style={{ background: s.bg, color: s.cor }}>{s.txt}</span></td>
+                          <td className="detalhe-td">{c.detalhe || "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
