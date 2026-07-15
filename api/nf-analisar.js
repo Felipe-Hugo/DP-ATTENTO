@@ -25,32 +25,40 @@ export default async function handler(req, res) {
     const listaImpostos = (impostos || []).map((i) => `${i.nome} (${i.percentual}%)`).join(", ");
     const listaServicos = (servicosINSS || []).join(", ");
 
-    const instrucoes = `Você é um Analista Fiscal Sênior especializado em retenção de tributos para condomínios no Brasil. Recebeu UMA nota fiscal (PDF) de um prestador de serviços${condominio ? ` do condomínio ${condominio}` : ""}. Analise-a com rigor.
+    const instrucoes = `Você é um Analista Fiscal Sênior especializado em retenção de tributos para condomínios no Brasil. Recebeu um PDF${condominio ? ` do condomínio ${condominio}` : ""} que contém UMA OU MAIS notas fiscais de prestadores de serviços (pode ser um pacote com várias notas e anexos). Analise TODAS as notas fiscais encontradas no documento. Ignore páginas que não sejam notas fiscais (boletos, comprovantes, capas).
 
-ETAPA 1 — EXTRAIA da nota: empresa prestadora, CNPJ, número da NF, data de emissão, valor bruto, descrição do serviço. Se algo estiver ilegível ou ausente, registre em "inconsistencias".
+Para CADA nota fiscal encontrada:
 
-ETAPA 2 — REGIME TRIBUTÁRIO: tente deduzir o regime (Simples Nacional, Lucro Presumido, Lucro Real) a partir de indícios na própria nota (ex.: menção "Optante pelo Simples Nacional", "não optante", CSTs, texto de retenção). Você NÃO tem acesso à consulta da Receita. Se a nota não deixar claro o regime, marque regime "Indefinido" e "regime_validar": true — NÃO invente.
+ETAPA 1 — EXTRAIA: empresa prestadora, CNPJ, número da NF, data de emissão, valor bruto, descrição do serviço. Se algo estiver ilegível ou ausente, registre em "inconsistencias".
+
+ETAPA 2 — REGIME TRIBUTÁRIO: tente deduzir o regime (Simples Nacional, Lucro Presumido, Lucro Real) a partir de indícios na própria nota (ex.: menção "Optante pelo Simples Nacional", "não optante", CSTs, texto de retenção). Você NÃO tem acesso à consulta da Receita. Se a nota não deixar claro, use regime "Indefinido" e "regime_validar": true — NÃO invente.
 
 ETAPA 3 — REGRAS DE RETENÇÃO (percentuais configurados: ${listaImpostos}):
-- SIMPLES NACIONAL: em regra NÃO retém PIS/COFINS/CSLL/IRRF. Mas se o serviço for de natureza previdenciária (${listaServicos}), sinalize que INSS pode ser devido → "inss_validar": true.
-- LUCRO PRESUMIDO ou LUCRO REAL: reter PIS, COFINS, CSLL e IRRF sobre o valor bruto, usando os percentuais configurados. Se a soma de PIS+COFINS+CSLL for menor que R$ ${pisoPCC}, marque dispensa do PCC em "observacoes". Se o serviço for previdenciário (lista acima), sinalize INSS → "inss_validar": true.
+- SIMPLES NACIONAL: em regra NÃO retém PIS/COFINS/CSLL/IRRF. Mas se o serviço for de natureza previdenciária (${listaServicos}), sinalize INSS → "inss_validar": true.
+- LUCRO PRESUMIDO ou LUCRO REAL: reter PIS, COFINS, CSLL e IRRF sobre o valor bruto, usando os percentuais configurados. Se a soma de PIS+COFINS+CSLL for menor que R$ ${pisoPCC}, marque dispensa do PCC em "observacoes". Se o serviço for previdenciário, sinalize INSS → "inss_validar": true.
 - Se o regime for Indefinido, NÃO calcule valores: marque tudo para validação humana.
 
 Calcule cada imposto = valor bruto × percentual / 100. Se um imposto não se aplica, use 0 e explique em "observacoes".
 
 REGRA ABSOLUTA DE FORMATO: responda começando com "{" e terminando com "}", sem markdown, sem texto fora do JSON:
 {
-  "empresa": "...", "cnpj": "...", "numero_nf": "...", "data_emissao": "...",
-  "valor_bruto": 0.00, "servico": "...",
-  "regime": "Simples Nacional|Lucro Presumido|Lucro Real|Indefinido",
-  "regime_validar": false,
-  "retencao_obrigatoria": true,
-  "retencoes": [ { "imposto": "PIS", "percentual": 0.65, "valor": 0.00, "reter": true, "motivo": "por que retém ou não" } ],
-  "inss_validar": false,
-  "total_retido": 0.00,
-  "inconsistencias": ["campos ilegíveis/ausentes"],
-  "observacoes": "resumo e alertas"
-}`;
+  "notas": [
+    {
+      "empresa": "...", "cnpj": "...", "numero_nf": "...", "data_emissao": "...",
+      "valor_bruto": 0.00, "servico": "...",
+      "regime": "Simples Nacional|Lucro Presumido|Lucro Real|Indefinido",
+      "regime_validar": false,
+      "retencao_obrigatoria": true,
+      "retencoes": [ { "imposto": "PIS", "percentual": 0.65, "valor": 0.00, "reter": true, "motivo": "por que retém ou não" } ],
+      "inss_validar": false,
+      "total_retido": 0.00,
+      "inconsistencias": [],
+      "observacoes": "resumo e alertas"
+    }
+  ],
+  "paginas_ignoradas": "resumo do que não era nota fiscal, se houver"
+}
+Se não houver nenhuma nota fiscal no PDF, retorne "notas": [] e explique em "paginas_ignoradas".`;
 
     const content = [
       { type: "document", source: { type: "base64", media_type: "application/pdf", data: nota.data }, title: nota.nome || "Nota" },
@@ -60,7 +68,7 @@ REGRA ABSOLUTA DE FORMATO: responda começando com "{" e terminando com "}", sem
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 2500, messages: [{ role: "user", content }] }),
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 6000, messages: [{ role: "user", content }] }),
     });
     if (!r.ok) return res.status(r.status).json({ error: "Erro na API Anthropic", detalhe: await r.text() });
 

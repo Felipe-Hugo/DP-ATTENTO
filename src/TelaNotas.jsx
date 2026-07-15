@@ -1,5 +1,39 @@
 import React, { useState } from "react";
+import { PDFDocument } from "pdf-lib";
 import { IMPOSTOS, SERVICOS_INSS, PISO_DISPENSA_PCC } from "./impostos-config.js";
+
+// Limite seguro por requisição (bytes do PDF; o base64 infla ~33%).
+const LIMITE_BYTES = 3 * 1024 * 1024; // 3 MB
+
+// Divide um PDF grande em partes menores (por páginas) para caber no limite da Vercel.
+async function prepararPartes(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length <= LIMITE_BYTES) return [{ nome: file.name, bytes }];
+  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const totalPag = doc.getPageCount();
+  const bytesPorPag = bytes.length / totalPag;
+  const pagsPorParte = Math.max(1, Math.floor(LIMITE_BYTES / bytesPorPag));
+  const partes = [];
+  for (let ini = 0; ini < totalPag; ini += pagsPorParte) {
+    const fim = Math.min(ini + pagsPorParte, totalPag);
+    const sub = await PDFDocument.create();
+    const idxs = Array.from({ length: fim - ini }, (_, k) => ini + k);
+    const pgs = await sub.copyPages(doc, idxs);
+    pgs.forEach((p) => sub.addPage(p));
+    const subBytes = await sub.save();
+    partes.push({ nome: `${file.name.replace(/\.pdf$/i, "")} (págs ${ini + 1}-${fim}).pdf`, bytes: new Uint8Array(subBytes) });
+  }
+  return partes;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -33,18 +67,27 @@ export default function TelaNotas() {
     setErro(null); setResultado(null);
     if (notas.length === 0) { setErro("Adicione ao menos uma nota fiscal."); return; }
     setCarregando(true);
-    const total = notas.length;
     try {
+      // 1) prepara: divide os PDFs grandes em partes menores
+      setProgresso({ feitos: 0, total: notas.length, etapa: "preparando" });
+      const partes = [];
+      for (const f of notas) {
+        const ps = await prepararPartes(f);
+        partes.push(...ps);
+      }
+
+      // 2) analisa parte por parte
+      const total = partes.length;
       const itens = [];
-      for (let i = 0; i < notas.length; i++) {
-        setProgresso({ feitos: i, total });
-        const f = notas[i];
-        const base64 = await fileToBase64(f);
+      for (let i = 0; i < partes.length; i++) {
+        setProgresso({ feitos: i, total, etapa: "analisando" });
+        const p = partes[i];
+        const base64 = bytesToBase64(p.bytes);
         const resp = await fetch("/api/nf-analisar", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            nota: { nome: f.name, data: base64 },
+            nota: { nome: p.nome, data: base64 },
             condominio,
             impostos: IMPOSTOS,
             servicosINSS: SERVICOS_INSS,
@@ -52,9 +95,11 @@ export default function TelaNotas() {
           }),
         });
         const raw = await resp.text();
-        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${f.name}": ${raw.slice(0, 300)}`); }
-        if (!resp.ok) throw new Error(`Falha em "${f.name}": ${data.error || resp.status}`);
-        itens.push(data);
+        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${p.nome}": ${raw.slice(0, 300)}`); }
+        if (!resp.ok) throw new Error(`Falha em "${p.nome}": ${data.error || resp.status}`);
+        // a API devolve { notas: [...] } — achata tudo num só resultado
+        const lista = Array.isArray(data.notas) ? data.notas : [data];
+        lista.forEach((n) => { n._arquivo = p.nome; itens.push(n); });
       }
       setResultado({ condominio, itens });
     } catch (e) {
@@ -100,7 +145,7 @@ export default function TelaNotas() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>Analisando nota {progresso.feitos + 1} de {progresso.total}…</span>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
