@@ -3,25 +3,49 @@ import { PDFDocument } from "pdf-lib";
 import { IMPOSTOS, SERVICOS_INSS, PISO_DISPENSA_PCC } from "./impostos-config.js";
 
 // Limite seguro por requisição (bytes do PDF; o base64 infla ~33%).
-const LIMITE_BYTES = 3 * 1024 * 1024; // 3 MB
+const LIMITE_BYTES = 2 * 1024 * 1024; // 2 MB por parte
+// Limite de páginas por parte, para evitar timeout da IA analisando muita nota de uma vez.
+const LIMITE_PAGINAS = 8;
 
-// Divide um PDF grande em partes menores (por páginas) para caber no limite da Vercel.
+// Extrai um subconjunto de páginas [ini, fim) de um PDFDocument.
+async function extrairPaginas(doc, ini, fim) {
+  const sub = await PDFDocument.create();
+  const idxs = Array.from({ length: fim - ini }, (_, k) => ini + k);
+  const pgs = await sub.copyPages(doc, idxs);
+  pgs.forEach((p) => sub.addPage(p));
+  return new Uint8Array(await sub.save());
+}
+
+// Divide PDF em partes menores que LIMITE_BYTES e com no máximo LIMITE_PAGINAS páginas.
 async function prepararPartes(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes.length <= LIMITE_BYTES) return [{ nome: file.name, bytes }];
-  const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  const docTeste = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  if (bytes.length <= LIMITE_BYTES && docTeste.getPageCount() <= LIMITE_PAGINAS) {
+    return [{ nome: file.name, bytes }];
+  }
+  const doc = docTeste;
   const totalPag = doc.getPageCount();
-  const bytesPorPag = bytes.length / totalPag;
-  const pagsPorParte = Math.max(1, Math.floor(LIMITE_BYTES / bytesPorPag));
+  const baseNome = file.name.replace(/\.pdf$/i, "");
   const partes = [];
-  for (let ini = 0; ini < totalPag; ini += pagsPorParte) {
-    const fim = Math.min(ini + pagsPorParte, totalPag);
-    const sub = await PDFDocument.create();
-    const idxs = Array.from({ length: fim - ini }, (_, k) => ini + k);
-    const pgs = await sub.copyPages(doc, idxs);
-    pgs.forEach((p) => sub.addPage(p));
-    const subBytes = await sub.save();
-    partes.push({ nome: `${file.name.replace(/\.pdf$/i, "")} (págs ${ini + 1}-${fim}).pdf`, bytes: new Uint8Array(subBytes) });
+  const fila = [[0, totalPag]];
+  while (fila.length) {
+    const [ini, fim] = fila.shift();
+    if (fim <= ini) continue;
+    const nPags = fim - ini;
+    if (nPags > LIMITE_PAGINAS) {
+      const meio = Math.floor((ini + fim) / 2);
+      fila.unshift([meio, fim]);
+      fila.unshift([ini, meio]);
+      continue;
+    }
+    const sub = await extrairPaginas(doc, ini, fim);
+    if (sub.length <= LIMITE_BYTES || nPags === 1) {
+      partes.push({ nome: `${baseNome} (págs ${ini + 1}-${fim}).pdf`, bytes: sub });
+    } else {
+      const meio = Math.floor((ini + fim) / 2);
+      fila.unshift([meio, fim]);
+      fila.unshift([ini, meio]);
+    }
   }
   return partes;
 }
@@ -35,14 +59,6 @@ function bytesToBase64(bytes) {
   return btoa(bin);
 }
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result.split(",")[1]);
-    r.onerror = () => reject(new Error("Falha ao ler " + file.name));
-    r.readAsDataURL(file);
-  });
-}
 const ehPDF = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name || "");
 const brl = (n) => (typeof n === "number" ? n : parseFloat(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -65,20 +81,18 @@ export default function TelaNotas() {
 
   async function analisar() {
     setErro(null); setResultado(null);
-    if (notas.length === 0) { setErro("Adicione ao menos uma nota fiscal."); return; }
+    if (notas.length === 0) { setErro("Adicione ao menos um arquivo com notas fiscais."); return; }
     setCarregando(true);
     try {
-      // 1) prepara: divide os PDFs grandes em partes menores
       setProgresso({ feitos: 0, total: notas.length, etapa: "preparando" });
       const partes = [];
       for (const f of notas) {
         const ps = await prepararPartes(f);
         partes.push(...ps);
       }
-
-      // 2) analisa parte por parte
       const total = partes.length;
       const itens = [];
+      const avisos = [];
       for (let i = 0; i < partes.length; i++) {
         setProgresso({ feitos: i, total, etapa: "analisando" });
         const p = partes[i];
@@ -97,11 +111,10 @@ export default function TelaNotas() {
         const raw = await resp.text();
         let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${p.nome}": ${raw.slice(0, 300)}`); }
         if (!resp.ok) throw new Error(`Falha em "${p.nome}": ${data.error || resp.status}`);
-        // a API devolve { notas: [...] } — achata tudo num só resultado
         const lista = Array.isArray(data.notas) ? data.notas : [data];
         lista.forEach((n) => { n._arquivo = p.nome; itens.push(n); });
       }
-      setResultado({ condominio, itens });
+      setResultado({ condominio, itens, avisos, partesTotal: total });
     } catch (e) {
       setErro(String(e.message || e));
     } finally {
@@ -140,12 +153,14 @@ export default function TelaNotas() {
         )}
 
         <button className="btn-primary" onClick={analisar} disabled={carregando}>
-          {carregando ? "Analisando…" : `Analisar ${notas.length} nota${notas.length === 1 ? "" : "s"}`}
+          {carregando ? "Analisando…" : `Analisar ${notas.length} arquivo${notas.length === 1 ? "" : "s"}`}
         </button>
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+            <span>{progresso.etapa === "preparando"
+              ? "Preparando arquivos (dividindo PDFs grandes)…"
+              : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
@@ -153,7 +168,20 @@ export default function TelaNotas() {
 
       {resultado && (
         <section>
-          {/* Relatório detalhado por nota */}
+          <div className="card" style={{ background: "#eef1f7", borderColor: "var(--navy)" }}>
+            <strong style={{ color: "var(--navy)", fontSize: 16 }}>
+              {resultado.itens.length} nota{resultado.itens.length === 1 ? "" : "s"} fiscal
+              {resultado.itens.length === 1 ? "" : "is"} encontrada
+              {resultado.itens.length === 1 ? "" : "s"}
+            </strong>
+            {resultado.condominio && <span className="muted"> · {resultado.condominio}</span>}
+            {resultado.partesTotal > 1 && (
+              <p className="muted" style={{ margin: "6px 0 0" }}>
+                O pacote foi analisado em {resultado.partesTotal} parte{resultado.partesTotal === 1 ? "" : "s"}.
+              </p>
+            )}
+          </div>
+
           {resultado.itens.map((it, i) => (
             <div className="card" key={i}>
               <div className="nf-hdr">
@@ -197,7 +225,6 @@ export default function TelaNotas() {
             </div>
           ))}
 
-          {/* Consolidado */}
           <div className="card">
             <h3 style={{ marginTop: 0, color: "var(--navy)" }}>Resumo consolidado</h3>
             <div style={{ overflowX: "auto" }}>
