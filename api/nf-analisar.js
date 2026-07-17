@@ -25,9 +25,16 @@ export default async function handler(req, res) {
     const listaImpostos = (impostos || []).map((i) => `${i.nome} (${i.percentual}%)`).join(", ");
     const listaServicos = (servicosINSS || []).join(", ");
 
-    const instrucoes = `Você é um Analista Fiscal Sênior especializado em retenção de tributos para condomínios no Brasil. Recebeu um PDF${condominio ? ` do condomínio ${condominio}` : ""} que contém UMA OU MAIS notas fiscais de prestadores de serviços (pode ser um pacote com várias notas e anexos). Analise TODAS as notas fiscais encontradas no documento. Ignore páginas que não sejam notas fiscais (boletos, comprovantes, capas).
+    const instrucoes = `Você é um Analista Fiscal Sênior especializado em retenção de tributos para condomínios no Brasil. Recebeu um PDF${condominio ? ` do condomínio ${condominio}` : ""} com um pacote de notas fiscais empilhadas de um mês inteiro. Pode conter DEZENAS de notas fiscais (10, 30, 80, 200 — quantas houver). Junto podem vir boletos, comprovantes e capas.
 
-Para CADA nota fiscal encontrada:
+INSTRUÇÃO CRÍTICA — EXAUSTIVIDADE:
+- Percorra o PDF INTEIRO, página por página, do início ao fim.
+- Identifique CADA nota fiscal individual (NFS-e, NF-e, RPS, DANFE). Cada nota é um item separado no array de saída.
+- NÃO PULE nenhuma nota. NÃO agrupe. NÃO resuma. Se houver 47 notas, o array de saída deve ter 47 itens.
+- Ignore APENAS páginas que claramente não são notas fiscais: boletos bancários, comprovantes PIX/TED, folhas de rosto, ordens de serviço avulsas. Se for uma nota, entra.
+- Se a mesma nota estiver em 2 páginas (frente e verso, ou continuação), trate como UM item só.
+
+Para CADA nota fiscal encontrada, extraia e classifique separadamente:
 
 ETAPA 1 — EXTRAIA: empresa prestadora, CNPJ, número da NF, data de emissão, valor bruto, descrição do serviço. Se algo estiver ilegível ou ausente, registre em "inconsistencias".
 
@@ -68,7 +75,7 @@ Se não houver nenhuma nota fiscal no PDF, retorne "notas": [] e explique em "pa
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 6000, messages: [{ role: "user", content }] }),
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 8000, messages: [{ role: "user", content }] }),
     });
     if (!r.ok) return res.status(r.status).json({ error: "Erro na API Anthropic", detalhe: await r.text() });
 

@@ -3,6 +3,7 @@ import { PDFDocument } from "pdf-lib";
 import { IMPOSTOS, SERVICOS_INSS, PISO_DISPENSA_PCC } from "./impostos-config.js";
 
 // Limite seguro por requisição (bytes do PDF; o base64 infla ~33%).
+// Vercel serverless: ~4,5 MB de payload; deixamos folga por causa do JSON envolvente.
 const LIMITE_BYTES = 2 * 1024 * 1024; // 2 MB por parte
 // Limite de páginas por parte, para evitar timeout da IA analisando muita nota de uma vez.
 const LIMITE_PAGINAS = 8;
@@ -16,22 +17,28 @@ async function extrairPaginas(doc, ini, fim) {
   return new Uint8Array(await sub.save());
 }
 
-// Divide PDF em partes menores que LIMITE_BYTES e com no máximo LIMITE_PAGINAS páginas.
+// Divide um PDF grande em partes menores que LIMITE_BYTES e com no máximo LIMITE_PAGINAS páginas.
+// Divisão adaptativa: se uma parte ainda ficar grande, subdivide de novo.
 async function prepararPartes(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const docTeste = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  // se cabe no limite de tamanho E no limite de páginas, envia inteiro
   if (bytes.length <= LIMITE_BYTES && docTeste.getPageCount() <= LIMITE_PAGINAS) {
     return [{ nome: file.name, bytes }];
   }
+
   const doc = docTeste;
   const totalPag = doc.getPageCount();
   const baseNome = file.name.replace(/\.pdf$/i, "");
   const partes = [];
+
+  // fila de intervalos [ini, fim) a processar
   const fila = [[0, totalPag]];
   while (fila.length) {
     const [ini, fim] = fila.shift();
     if (fim <= ini) continue;
     const nPags = fim - ini;
+    // se ultrapassa limite de páginas, divide sem nem gerar o PDF
     if (nPags > LIMITE_PAGINAS) {
       const meio = Math.floor((ini + fim) / 2);
       fila.unshift([meio, fim]);
@@ -59,6 +66,14 @@ function bytesToBase64(bytes) {
   return btoa(bin);
 }
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(",")[1]);
+    r.onerror = () => reject(new Error("Falha ao ler " + file.name));
+    r.readAsDataURL(file);
+  });
+}
 const ehPDF = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name || "");
 const brl = (n) => (typeof n === "number" ? n : parseFloat(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -84,24 +99,88 @@ export default function TelaNotas() {
     if (notas.length === 0) { setErro("Adicione ao menos um arquivo com notas fiscais."); return; }
     setCarregando(true);
     try {
+      // 1) prepara: divide os PDFs grandes em partes menores
       setProgresso({ feitos: 0, total: notas.length, etapa: "preparando" });
       const partes = [];
       for (const f of notas) {
         const ps = await prepararPartes(f);
         partes.push(...ps);
       }
-      const total = partes.length;
+
+      // 2) TRIAGEM: para cada parte, descobre quais páginas são NF.
+      //    Depois, monta blocos contíguos de NF para enviar à análise fiscal.
+      const totalPartes = partes.length;
+      const blocosNF = []; // [{ nome, bytes (PDF só com as páginas NF), origem }]
+      let paginasDescartadas = 0;
+      let paginasNF = 0;
+
+      for (let i = 0; i < partes.length; i++) {
+        setProgresso({ feitos: i, total: totalPartes, etapa: "triando" });
+        const p = partes[i];
+        const doc = await PDFDocument.load(p.bytes, { ignoreEncryption: true });
+        const nPags = doc.getPageCount();
+
+        // chama a triagem
+        const respT = await fetch("/api/nf-triar", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pdf: { nome: p.nome, data: bytesToBase64(p.bytes) }, paginaInicial: 1 }),
+        });
+        const rawT = await respT.text();
+        let dataT; try { dataT = JSON.parse(rawT); } catch { throw new Error(`Triagem falhou em "${p.nome}": ${rawT.slice(0, 300)}`); }
+        if (!respT.ok) throw new Error(`Triagem falhou em "${p.nome}": ${dataT.error || respT.status}`);
+
+        // encontra intervalos contíguos de páginas NF
+        const paginas = dataT.paginas || [];
+        const isNF = (t) => String(t || "").toUpperCase() === "NF";
+        // normaliza: cria vetor booleano por índice de página (0..nPags-1)
+        const marcada = new Array(nPags).fill(false);
+        paginas.forEach((pg) => {
+          const idx = (pg.n - 1); // triagem começa em 1
+          if (idx >= 0 && idx < nPags && isNF(pg.tipo)) marcada[idx] = true;
+        });
+        // agrupa em intervalos contíguos
+        const intervalos = [];
+        let ini = -1;
+        for (let k = 0; k < nPags; k++) {
+          if (marcada[k] && ini < 0) ini = k;
+          if ((!marcada[k] || k === nPags - 1) && ini >= 0) {
+            const fim = marcada[k] ? k + 1 : k;
+            intervalos.push([ini, fim]);
+            ini = -1;
+          }
+        }
+        // gera um novo PDF por intervalo (bloco de NFs contíguas)
+        for (const [a, b] of intervalos) {
+          const sub = await PDFDocument.create();
+          const idxs = Array.from({ length: b - a }, (_, k) => a + k);
+          const pgs = await sub.copyPages(doc, idxs);
+          pgs.forEach((x) => sub.addPage(x));
+          const subBytes = new Uint8Array(await sub.save());
+          blocosNF.push({
+            nome: `${p.nome.replace(/\.pdf$/i, "")} · NF págs ${a + 1}-${b}.pdf`,
+            bytes: subBytes,
+          });
+          paginasNF += (b - a);
+        }
+        paginasDescartadas += (nPags - marcada.filter(Boolean).length);
+      }
+
+      // 3) ANÁLISE FISCAL — só nos blocos de NF
+      const totalBlocos = blocosNF.length;
       const itens = [];
       const avisos = [];
-      for (let i = 0; i < partes.length; i++) {
-        setProgresso({ feitos: i, total, etapa: "analisando" });
-        const p = partes[i];
-        const base64 = bytesToBase64(p.bytes);
+      if (totalBlocos === 0) {
+        avisos.push("Nenhuma página foi classificada como nota fiscal.");
+      }
+      for (let i = 0; i < blocosNF.length; i++) {
+        setProgresso({ feitos: i, total: totalBlocos, etapa: "analisando" });
+        const b = blocosNF[i];
         const resp = await fetch("/api/nf-analisar", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            nota: { nome: p.nome, data: base64 },
+            nota: { nome: b.nome, data: bytesToBase64(b.bytes) },
             condominio,
             impostos: IMPOSTOS,
             servicosINSS: SERVICOS_INSS,
@@ -109,18 +188,26 @@ export default function TelaNotas() {
           }),
         });
         const raw = await resp.text();
-        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${p.nome}": ${raw.slice(0, 300)}`); }
-        if (!resp.ok) throw new Error(`Falha em "${p.nome}": ${data.error || resp.status}`);
+        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${b.nome}": ${raw.slice(0, 300)}`); }
+        if (!resp.ok) throw new Error(`Falha em "${b.nome}": ${data.error || resp.status}`);
         const lista = Array.isArray(data.notas) ? data.notas : [data];
-        lista.forEach((n) => { n._arquivo = p.nome; itens.push(n); });
+        lista.forEach((n) => { n._arquivo = b.nome; itens.push(n); });
+        if (data._truncado) avisos.push(`${b.nome}: resposta pode estar incompleta`);
       }
-      setResultado({ condominio, itens, avisos, partesTotal: total });
+
+      setResultado({
+        condominio, itens, avisos,
+        partesTotal: totalPartes,
+        blocosNF: totalBlocos,
+        paginasNF, paginasDescartadas,
+      });
     } catch (e) {
       setErro(String(e.message || e));
     } finally {
       setCarregando(false); setProgresso(null);
     }
   }
+
 
   return (
     <>
@@ -158,9 +245,7 @@ export default function TelaNotas() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando"
-              ? "Preparando arquivos (dividindo PDFs grandes)…"
-              : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "triando" ? `Triando páginas ${progresso.feitos + 1} de ${progresso.total} (separando NFs de anexos)…` : `Analisando bloco ${progresso.feitos + 1} de ${progresso.total}…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
@@ -175,13 +260,20 @@ export default function TelaNotas() {
               {resultado.itens.length === 1 ? "" : "s"}
             </strong>
             {resultado.condominio && <span className="muted"> · {resultado.condominio}</span>}
-            {resultado.partesTotal > 1 && (
+            {(resultado.paginasNF > 0 || resultado.paginasDescartadas > 0) && (
               <p className="muted" style={{ margin: "6px 0 0" }}>
-                O pacote foi analisado em {resultado.partesTotal} parte{resultado.partesTotal === 1 ? "" : "s"}.
+                Triagem: {resultado.paginasNF} página{resultado.paginasNF === 1 ? "" : "s"} de NF analisada{resultado.paginasNF === 1 ? "" : "s"},{" "}
+                {resultado.paginasDescartadas} descartada{resultado.paginasDescartadas === 1 ? "" : "s"} (boletos/comprovantes/anexos).
               </p>
+            )}
+            {resultado.avisos?.length > 0 && (
+              <div style={{ marginTop: 10, padding: "8px 12px", background: "#fef5e7", color: "#b7791f", borderRadius: 6, fontSize: 13 }}>
+                <strong>Atenção:</strong> {resultado.avisos.join("; ")}. Considere subir o pacote em arquivos menores se alguma nota faltar.
+              </div>
             )}
           </div>
 
+          {/* Relatório detalhado por nota */}
           {resultado.itens.map((it, i) => (
             <div className="card" key={i}>
               <div className="nf-hdr">
@@ -225,6 +317,7 @@ export default function TelaNotas() {
             </div>
           ))}
 
+          {/* Consolidado */}
           <div className="card">
             <h3 style={{ marginTop: 0, color: "var(--navy)" }}>Resumo consolidado</h3>
             <div style={{ overflowX: "auto" }}>
