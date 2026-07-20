@@ -80,6 +80,7 @@ const brl = (n) => (typeof n === "number" ? n : parseFloat(n) || 0).toLocaleStri
 export default function TelaNotas() {
   const [notas, setNotas] = useState([]);
   const [condominio, setCondominio] = useState("");
+  const [pularTriagem, setPularTriagem] = useState(false);
   const [carregando, setCarregando] = useState(false);
   const [progresso, setProgresso] = useState(null);
   const [resultado, setResultado] = useState(null);
@@ -115,30 +116,34 @@ export default function TelaNotas() {
       let paginasNF = 0;
 
       for (let i = 0; i < partes.length; i++) {
-        setProgresso({ feitos: i, total: totalPartes, etapa: "triando" });
+        setProgresso({ feitos: i, total: totalPartes, etapa: pularTriagem ? "empacotando" : "triando" });
         const p = partes[i];
         const doc = await PDFDocument.load(p.bytes, { ignoreEncryption: true });
         const nPags = doc.getPageCount();
 
-        // chama a triagem
-        const respT = await fetch("/api/nf-triar", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pdf: { nome: p.nome, data: bytesToBase64(p.bytes) }, paginaInicial: 1 }),
-        });
-        const rawT = await respT.text();
-        let dataT; try { dataT = JSON.parse(rawT); } catch { throw new Error(`Triagem falhou em "${p.nome}": ${rawT.slice(0, 300)}`); }
-        if (!respT.ok) throw new Error(`Triagem falhou em "${p.nome}": ${dataT.error || respT.status}`);
+        // MODO 1 (padrão): chama a triagem — separa NF de anexos
+        // MODO 2 (pular): considera TODAS as páginas como NF, sem chamar IA
+        let marcada;
+        if (pularTriagem) {
+          marcada = new Array(nPags).fill(true);
+        } else {
+          const respT = await fetch("/api/nf-triar", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pdf: { nome: p.nome, data: bytesToBase64(p.bytes) }, paginaInicial: 1 }),
+          });
+          const rawT = await respT.text();
+          let dataT; try { dataT = JSON.parse(rawT); } catch { throw new Error(`Triagem falhou em "${p.nome}": ${rawT.slice(0, 300)}`); }
+          if (!respT.ok) throw new Error(`Triagem falhou em "${p.nome}": ${dataT.error || respT.status}`);
+          const paginas = dataT.paginas || [];
+          const isNF = (t) => String(t || "").toUpperCase() === "NF";
+          marcada = new Array(nPags).fill(false);
+          paginas.forEach((pg) => {
+            const idx = (pg.n - 1);
+            if (idx >= 0 && idx < nPags && isNF(pg.tipo)) marcada[idx] = true;
+          });
+        }
 
-        // encontra intervalos contíguos de páginas NF
-        const paginas = dataT.paginas || [];
-        const isNF = (t) => String(t || "").toUpperCase() === "NF";
-        // normaliza: cria vetor booleano por índice de página (0..nPags-1)
-        const marcada = new Array(nPags).fill(false);
-        paginas.forEach((pg) => {
-          const idx = (pg.n - 1); // triagem começa em 1
-          if (idx >= 0 && idx < nPags && isNF(pg.tipo)) marcada[idx] = true;
-        });
         // agrupa em intervalos contíguos
         const intervalos = [];
         let ini = -1;
@@ -219,6 +224,11 @@ export default function TelaNotas() {
             onChange={(e) => setCondominio(e.target.value)} />
         </label>
 
+        <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 14px", fontSize: 14, cursor: "pointer" }}>
+          <input type="checkbox" checked={pularTriagem} onChange={(e) => setPularTriagem(e.target.checked)} />
+          <span>Pular triagem (marque quando o PDF já contém <strong>apenas notas fiscais</strong>, sem boletos ou comprovantes — economiza uma chamada de IA)</span>
+        </label>
+
         <div className={"dropzone" + (drag ? " drag" : "")}
           onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
           onDragLeave={() => setDrag(false)}
@@ -245,7 +255,7 @@ export default function TelaNotas() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "triando" ? `Triando páginas ${progresso.feitos + 1} de ${progresso.total} (separando NFs de anexos)…` : `Analisando bloco ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "triando" ? `Triando páginas ${progresso.feitos + 1} de ${progresso.total} (separando NFs de anexos)…` : progresso.etapa === "empacotando" ? `Empacotando parte ${progresso.feitos + 1} de ${progresso.total} (triagem pulada)…` : `Analisando bloco ${progresso.feitos + 1} de ${progresso.total}…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
