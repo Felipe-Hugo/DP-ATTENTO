@@ -3,7 +3,7 @@ import { PDFDocument } from "pdf-lib";
 import { BOOK_CHECKLIST, BOOK_CONDICIONAIS } from "./checklist.js";
 
 const LIMITE_BYTES = 2 * 1024 * 1024;
-const LIMITE_PAGINAS = 8;
+const LIMITE_PAGINAS = 3;
 
 const STATUS = {
   ok: { cor: "#1f9d55", bg: "#e6f4ea", ic: "✓", txt: "OK" },
