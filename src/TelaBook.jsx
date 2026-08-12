@@ -1,5 +1,9 @@
 import React, { useState } from "react";
+import { PDFDocument } from "pdf-lib";
 import { BOOK_CHECKLIST, BOOK_CONDICIONAIS } from "./checklist.js";
+
+const LIMITE_BYTES = 2 * 1024 * 1024;
+const LIMITE_PAGINAS = 8;
 
 const STATUS = {
   ok: { cor: "#1f9d55", bg: "#e6f4ea", ic: "✓", txt: "OK" },
@@ -9,13 +13,54 @@ const STATUS = {
   nao_aplicavel: { cor: "#5a6b8c", bg: "#eef1f7", ic: "·", txt: "N/A" },
 };
 
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result.split(",")[1]);
-    r.onerror = () => reject(new Error("Falha ao ler " + file.name));
-    r.readAsDataURL(file);
-  });
+async function extrairPaginas(doc, ini, fim) {
+  const sub = await PDFDocument.create();
+  const idxs = Array.from({ length: fim - ini }, (_, k) => ini + k);
+  const pgs = await sub.copyPages(doc, idxs);
+  pgs.forEach((p) => sub.addPage(p));
+  return new Uint8Array(await sub.save());
+}
+
+async function prepararPartes(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const docTeste = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  if (bytes.length <= LIMITE_BYTES && docTeste.getPageCount() <= LIMITE_PAGINAS) {
+    return [{ nome: file.name, bytes }];
+  }
+  const doc = docTeste;
+  const totalPag = doc.getPageCount();
+  const baseNome = file.name.replace(/\.pdf$/i, "");
+  const partes = [];
+  const fila = [[0, totalPag]];
+  while (fila.length) {
+    const [ini, fim] = fila.shift();
+    if (fim <= ini) continue;
+    const nPags = fim - ini;
+    if (nPags > LIMITE_PAGINAS) {
+      const meio = Math.floor((ini + fim) / 2);
+      fila.unshift([meio, fim]);
+      fila.unshift([ini, meio]);
+      continue;
+    }
+    const sub = await extrairPaginas(doc, ini, fim);
+    if (sub.length <= LIMITE_BYTES || nPags === 1) {
+      partes.push({ nome: `${baseNome} (págs ${ini + 1}-${fim}).pdf`, bytes: sub });
+    } else {
+      const meio = Math.floor((ini + fim) / 2);
+      fila.unshift([meio, fim]);
+      fila.unshift([ini, meio]);
+    }
+  }
+  return partes;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
 }
 
 export default function TelaBook() {
@@ -27,43 +72,48 @@ export default function TelaBook() {
   const [erro, setErro] = useState(null);
   const [drag, setDrag] = useState(false);
 
-  const ehPDF = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name || "");
-
   const addFiles = (lista) => {
-    const todos = Array.from(lista);
-    const pdfs = todos.filter(ehPDF);
-    const ignorados = todos.filter((f) => !ehPDF(f));
-    if (ignorados.length) setErro(`Ignorado(s) por não ser(em) PDF: ${ignorados.map((f) => f.name).join(", ")}`);
-    else setErro(null);
-    if (pdfs.length) setArquivos((p) => [...p, ...pdfs]);
+    const pdfs = Array.from(lista).filter((f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name || ""));
+    setArquivos((p) => [...p, ...pdfs]);
   };
 
   async function conferir() {
     setErro(null); setResultado(null);
     if (arquivos.length === 0) { setErro("Adicione pelo menos um PDF."); return; }
     setCarregando(true);
-    const total = arquivos.length;
     try {
+      // 1) prepara: divide qualquer PDF grande em partes menores
+      setProgresso({ feitos: 0, total: arquivos.length, etapa: "preparando" });
+      const partes = [];
+      for (const f of arquivos) {
+        const ps = await prepararPartes(f);
+        partes.push(...ps);
+      }
+
+      // 2) analisa parte por parte
+      const total = partes.length;
       const analises = [];
-      for (let i = 0; i < arquivos.length; i++) {
+      for (let i = 0; i < partes.length; i++) {
         setProgresso({ feitos: i, total, etapa: "analisando" });
-        const f = arquivos[i];
-        const base64 = await fileToBase64(f);
+        const p = partes[i];
+        const base64 = bytesToBase64(p.bytes);
         const resp = await fetch("/api/book-analisar", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            documento: { nome: f.name, data: base64 },
+            documento: { nome: p.nome, data: base64 },
             checklist: BOOK_CHECKLIST,
             condicionais: BOOK_CONDICIONAIS,
             competencia,
           }),
         });
         const raw = await resp.text();
-        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${f.name}": ${raw.slice(0, 300)}`); }
-        if (!resp.ok) throw new Error(`Falha em "${f.name}": ${data.error || resp.status}`);
+        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${p.nome}": ${raw.slice(0, 120)}`); }
+        if (!resp.ok) throw new Error(`Falha em "${p.nome}": ${data.error || resp.status}`);
         analises.push(data);
       }
+
+      // 3) consolida
       setProgresso({ feitos: total, total, etapa: "consolidando" });
       const respC = await fetch("/api/book-consolidar", {
         method: "POST",
@@ -71,7 +121,7 @@ export default function TelaBook() {
         body: JSON.stringify({ analises, checklist: BOOK_CHECKLIST, condicionais: BOOK_CONDICIONAIS, competencia }),
       });
       const rawC = await respC.text();
-      let dataC; try { dataC = JSON.parse(rawC); } catch { throw new Error("Consolidação inválida: " + rawC.slice(0, 300)); }
+      let dataC; try { dataC = JSON.parse(rawC); } catch { throw new Error("Consolidação inválida: " + rawC.slice(0, 120)); }
       if (!respC.ok) throw new Error(dataC.error || "Erro na consolidação");
       setResultado(dataC);
     } catch (e) {
@@ -120,7 +170,7 @@ export default function TelaBook() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "consolidando" ? "Cruzando documentos e consolidando…" : `Analisando documento ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? "Cruzando documentos e consolidando…" : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
@@ -150,10 +200,7 @@ export default function TelaBook() {
                   return (
                     <li key={i}>
                       <span className="badge" style={{ color: s.cor, background: s.bg }}>{s.ic} {s.txt}</span>
-                      <span className="clabel">
-                        {c.label}
-                        {c.obs ? <small className="motivo">{c.obs}</small> : null}
-                      </span>
+                      <span className="clabel">{c.label}{c.obs ? <small> — {c.obs}</small> : null}</span>
                     </li>
                   );
                 })}
