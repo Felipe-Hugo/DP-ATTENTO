@@ -77,7 +77,7 @@ export default function TelaBook() {
     setArquivos((p) => [...p, ...pdfs]);
   };
 
-    async function conferir() {
+  async function conferir() {
     setErro(null); setResultado(null);
     if (arquivos.length === 0) { setErro("Adicione pelo menos um PDF."); return; }
     setCarregando(true);
@@ -153,6 +153,38 @@ export default function TelaBook() {
     }
   }
 
+  return (
+    <>
+      <h2 className="tela-titulo">Conferência de Book de Terceirizadas</h2>
+      <section className="card">
+        <label className="campo">
+          Competência de referência
+          <input type="text" placeholder="MM/AAAA (opcional)" value={competencia}
+            onChange={(e) => setCompetencia(e.target.value)} />
+        </label>
+
+        <div className={"dropzone" + (drag ? " drag" : "")}
+          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={(e) => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}
+          onClick={() => document.getElementById("bookInput").click()}>
+          <input id="bookInput" type="file" accept=".pdf,application/pdf" multiple style={{ display: "none" }}
+            onChange={(e) => addFiles(e.target.files)} />
+          <strong>Arraste os PDFs do book aqui</strong>
+          <span>ou clique para selecionar — pode incluir várias terceirizadas</span>
+        </div>
+
+        {arquivos.length > 0 && (
+          <ul className="filelist">
+            {arquivos.map((f, i) => (
+              <li key={i}>
+                <span className="fname">📄 {f.name}</span>
+                <button className="rm" onClick={() => setArquivos((p) => p.filter((_, x) => x !== i))}>remover</button>
+              </li>
+            ))}
+          </ul>
+        )}
+
         <button className="btn-primary" onClick={conferir} disabled={carregando}>
           {carregando ? "Processando…" : `Conferir book (${arquivos.length} arquivo${arquivos.length === 1 ? "" : "s"})`}
         </button>
@@ -160,7 +192,8 @@ export default function TelaBook() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? `Consolidando lote ${progresso.feitos + 1} de ${progresso.total}…` : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>          </div>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? `Consolidando lote ${progresso.feitos + 1} de ${progresso.total}…` : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+          </div>
         )}
         {erro && <div className="erro">{erro}</div>}
       </section>
