@@ -160,8 +160,7 @@ export default function TelaBook() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? "Cruzando documentos e consolidando…" : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
-          </div>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? `Consolidando lote ${progresso.feitos + 1} de ${progresso.total}…` : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>          </div>
         )}
         {erro && <div className="erro">{erro}</div>}
       </section>
