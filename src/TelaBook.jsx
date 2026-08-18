@@ -77,7 +77,7 @@ export default function TelaBook() {
     setArquivos((p) => [...p, ...pdfs]);
   };
 
-  async function conferir() {
+    async function conferir() {
     setErro(null); setResultado(null);
     if (arquivos.length === 0) { setErro("Adicione pelo menos um PDF."); return; }
     setCarregando(true);
@@ -113,55 +113,45 @@ export default function TelaBook() {
         analises.push(data);
       }
 
-      // 3) consolida
-      setProgresso({ feitos: total, total, etapa: "consolidando" });
-      const respC = await fetch("/api/book-consolidar", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ analises, checklist: BOOK_CHECKLIST, condicionais: BOOK_CONDICIONAIS, competencia }),
+      // 3) agrupa as análises por terceirizada (cnpj, ou nome se não tiver cnpj)
+      const grupos = new Map();
+      for (const a of analises) {
+        const chave = (a.terceirizada?.cnpj || a.terceirizada?.nome || "desconhecida").trim().toUpperCase();
+        if (!grupos.has(chave)) grupos.set(chave, []);
+        grupos.get(chave).push(a);
+      }
+      const listaGrupos = Array.from(grupos.values());
+
+      // 4) consolida grupo por grupo (chamadas pequenas, sem risco de timeout)
+      const terceirizadasFinal = [];
+      const resumos = [];
+      let competenciaDetectada = null;
+      for (let i = 0; i < listaGrupos.length; i++) {
+        setProgresso({ feitos: i, total: listaGrupos.length, etapa: "consolidando" });
+        const respC = await fetch("/api/book-consolidar", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ analises: listaGrupos[i], checklist: BOOK_CHECKLIST, condicionais: BOOK_CONDICIONAIS, competencia }),
+        });
+        const rawC = await respC.text();
+        let dataC; try { dataC = JSON.parse(rawC); } catch { throw new Error(`Consolidação inválida (lote ${i + 1}): ${rawC.slice(0, 120)}`); }
+        if (!respC.ok) throw new Error(`Erro na consolidação (lote ${i + 1}): ${dataC.error || respC.status}`);
+        if (dataC.competencia_detectada && !competenciaDetectada) competenciaDetectada = dataC.competencia_detectada;
+        if (dataC.resumo_geral) resumos.push(dataC.resumo_geral);
+        (dataC.terceirizadas || []).forEach((t) => terceirizadasFinal.push(t));
+      }
+
+      setResultado({
+        competencia_detectada: competenciaDetectada,
+        terceirizadas: terceirizadasFinal,
+        resumo_geral: resumos.join(" "),
       });
-      const rawC = await respC.text();
-      let dataC; try { dataC = JSON.parse(rawC); } catch { throw new Error("Consolidação inválida: " + rawC.slice(0, 120)); }
-      if (!respC.ok) throw new Error(dataC.error || "Erro na consolidação");
-      setResultado(dataC);
     } catch (e) {
       setErro(String(e.message || e));
     } finally {
       setCarregando(false); setProgresso(null);
     }
   }
-
-  return (
-    <>
-      <h2 className="tela-titulo">Conferência de Book de Terceirizadas</h2>
-      <section className="card">
-        <label className="campo">
-          Competência de referência
-          <input type="text" placeholder="MM/AAAA (opcional)" value={competencia}
-            onChange={(e) => setCompetencia(e.target.value)} />
-        </label>
-
-        <div className={"dropzone" + (drag ? " drag" : "")}
-          onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={(e) => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}
-          onClick={() => document.getElementById("bookInput").click()}>
-          <input id="bookInput" type="file" accept=".pdf,application/pdf" multiple style={{ display: "none" }}
-            onChange={(e) => addFiles(e.target.files)} />
-          <strong>Arraste os PDFs do book aqui</strong>
-          <span>ou clique para selecionar — pode incluir várias terceirizadas</span>
-        </div>
-
-        {arquivos.length > 0 && (
-          <ul className="filelist">
-            {arquivos.map((f, i) => (
-              <li key={i}>
-                <span className="fname">📄 {f.name}</span>
-                <button className="rm" onClick={() => setArquivos((p) => p.filter((_, x) => x !== i))}>remover</button>
-              </li>
-            ))}
-          </ul>
-        )}
 
         <button className="btn-primary" onClick={conferir} disabled={carregando}>
           {carregando ? "Processando…" : `Conferir book (${arquivos.length} arquivo${arquivos.length === 1 ? "" : "s"})`}
