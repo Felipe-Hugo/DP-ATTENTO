@@ -1,18 +1,5 @@
 // api/book-analisar.js — analisa UM PDF do book, identifica terceirizada e classifica os documentos contidos.
-export const config = { maxDuration: 60 };
-
-// Extrai JSON mesmo que a IA responda com texto em volta.
-function extrairJSON(texto) {
-  const limpo = String(texto || "").replace(/```json|```/g, "").trim();
-  try { return JSON.parse(limpo); } catch {}
-  const ini = limpo.indexOf("{");
-  const fim = limpo.lastIndexOf("}");
-  if (ini >= 0 && fim > ini) {
-    try { return JSON.parse(limpo.slice(ini, fim + 1)); } catch {}
-  }
-  return null;
-}
-
+export const config = { maxDuration: 300 };
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido" });
@@ -53,16 +40,19 @@ Inclua em itens_presentes apenas os documentos que você localizou neste PDF (co
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 8000, messages: [{ role: "user", content }] }),
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3000, messages: [{ role: "user", content }] }),
     });
     if (!r.ok) return res.status(r.status).json({ error: "Erro na API Anthropic", detalhe: await r.text() });
 
     const data = await r.json();
     const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").replace(/```json|```/g, "").trim();
-    const parsed = extrairJSON(texto);
-    if (!parsed) {
-      const resumo = String(texto || "").slice(0, 400);
-      return res.status(502).json({ error: `A IA não retornou JSON. Ela respondeu: ${resumo}` });
+    let parsed; try { parsed = JSON.parse(texto); } catch { return res.status(502).json({ error: "Resposta não-JSON", bruto: texto }); }
+    parsed._arquivo = documento.nome;
+    return res.status(200).json(parsed);
+  } catch (e) {
+    return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
+  }
+}      return res.status(502).json({ error: `A IA não retornou JSON. Ela respondeu: ${resumo}` });
     }
     parsed._arquivo = documento.nome;
     return res.status(200).json(parsed);
