@@ -1,18 +1,5 @@
 // api/book-consolidar.js — consolida as análises e monta o checklist por terceirizada na ordem do book.
-export const config = { maxDuration: 60 };
-
-// Extrai JSON mesmo que a IA responda com texto em volta.
-function extrairJSON(texto) {
-  const limpo = String(texto || "").replace(/```json|```/g, "").trim();
-  try { return JSON.parse(limpo); } catch {}
-  const ini = limpo.indexOf("{");
-  const fim = limpo.lastIndexOf("}");
-  if (ini >= 0 && fim > ini) {
-    try { return JSON.parse(limpo.slice(ini, fim + 1)); } catch {}
-  }
-  return null;
-}
-
+export const config = { maxDuration: 300 };
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido" });
@@ -42,8 +29,6 @@ Agrupe por terceirizada e, para CADA UMA, monte o checklist com TODOS os itens d
 - "ausente" não encontrado (obrigatório)
 - "nao_aplicavel" condicional sem evento
 
-IMPORTANTE — para CADA item, preencha "obs" com UMA FRASE explicando o motivo do status: o que foi verificado e por que passou ou falhou. Exemplos: "Guia FGTS presente, valor R$ 134,40 confere com o detalhamento." / "Comprovante de pagamento do FGTS não localizado no book." / "Certidão trabalhista negativa e válida até 30/03/2026." / "Não há rescisão nesta competência, item não se aplica." Nunca deixe "obs" vazio.
-
 Responda APENAS com JSON válido, sem markdown:
 {
   "competencia_detectada": "MM/AAAA ou null",
@@ -67,11 +52,7 @@ Score 0 a 100 (peso maior para itens críticos/ausentes obrigatórios). O checkl
 
     const data = await r.json();
     const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").replace(/```json|```/g, "").trim();
-    const parsed = extrairJSON(texto);
-    if (!parsed) {
-      const resumo = String(texto || "").slice(0, 400);
-      return res.status(502).json({ error: `A IA não retornou JSON. Ela respondeu: ${resumo}` });
-    }
+    let parsed; try { parsed = JSON.parse(texto); } catch { return res.status(502).json({ error: "Consolidação não-JSON", bruto: texto }); }
     return res.status(200).json(parsed);
   } catch (e) {
     return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
