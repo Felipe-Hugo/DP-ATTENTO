@@ -4,6 +4,8 @@ import { BOOK_CHECKLIST, BOOK_CONDICIONAIS } from "./checklist.js";
 
 const LIMITE_BYTES = 2 * 1024 * 1024;
 const LIMITE_PAGINAS = 3;
+const LOTE_PARALELO = 4;   // quantas análises rodam ao mesmo tempo
+const TENTATIVAS = 3;      // 1 tentativa + 2 retries por parte
 
 const STATUS = {
   ok: { cor: "#1f9d55", bg: "#e6f4ea", ic: "✓", txt: "OK" },
@@ -63,6 +65,49 @@ function bytesToBase64(bytes) {
   return btoa(bin);
 }
 
+const espera = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// chama uma API com até TENTATIVAS tentativas (retry com espera crescente)
+async function chamarComRetry(url, body, rotulo) {
+  let ultimoErro = null;
+  for (let t = 1; t <= TENTATIVAS; t++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const raw = await resp.text();
+      let data;
+      try { data = JSON.parse(raw); } catch { throw new Error(`${rotulo}: resposta inválida — ${raw.slice(0, 120)}`); }
+      if (!resp.ok) throw new Error(`${rotulo}: ${data.error || resp.status}`);
+      return data;
+    } catch (e) {
+      ultimoErro = e;
+      if (t < TENTATIVAS) await espera(1500 * t); // espera 1,5s, depois 3s
+    }
+  }
+  throw ultimoErro;
+}
+
+// roda tarefas em paralelo limitado (no máx. LOTE_PARALELO ao mesmo tempo)
+async function rodarEmParalelo(itens, executar, aoTerminarUma) {
+  const resultados = new Array(itens.length);
+  let proximo = 0;
+  let feitos = 0;
+  async function trabalhador() {
+    while (proximo < itens.length) {
+      const i = proximo++;
+      resultados[i] = await executar(itens[i], i);
+      feitos++;
+      aoTerminarUma?.(feitos);
+    }
+  }
+  const n = Math.min(LOTE_PARALELO, itens.length);
+  await Promise.all(Array.from({ length: n }, trabalhador));
+  return resultados;
+}
+
 export default function TelaBook() {
   const [arquivos, setArquivos] = useState([]);
   const [competencia, setCompetencia] = useState("");
@@ -90,28 +135,23 @@ export default function TelaBook() {
         partes.push(...ps);
       }
 
-      // 2) analisa parte por parte
+      // 2) analisa em paralelo (LOTE_PARALELO por vez), com retry por parte
       const total = partes.length;
-      const analises = [];
-      for (let i = 0; i < partes.length; i++) {
-        setProgresso({ feitos: i, total, etapa: "analisando" });
-        const p = partes[i];
-        const base64 = bytesToBase64(p.bytes);
-        const resp = await fetch("/api/book-analisar", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            documento: { nome: p.nome, data: base64 },
+      setProgresso({ feitos: 0, total, etapa: "analisando" });
+      const analises = await rodarEmParalelo(
+        partes,
+        (p) => chamarComRetry(
+          "/api/book-analisar",
+          {
+            documento: { nome: p.nome, data: bytesToBase64(p.bytes) },
             checklist: BOOK_CHECKLIST,
             condicionais: BOOK_CONDICIONAIS,
             competencia,
-          }),
-        });
-        const raw = await resp.text();
-        let data; try { data = JSON.parse(raw); } catch { throw new Error(`Falha em "${p.nome}": ${raw.slice(0, 120)}`); }
-        if (!resp.ok) throw new Error(`Falha em "${p.nome}": ${data.error || resp.status}`);
-        analises.push(data);
-      }
+          },
+          `Falha em "${p.nome}"`
+        ),
+        (feitos) => setProgresso({ feitos, total, etapa: "analisando" })
+      );
 
       // 3) agrupa as análises por terceirizada (cnpj, ou nome se não tiver cnpj)
       const grupos = new Map();
@@ -122,20 +162,22 @@ export default function TelaBook() {
       }
       const listaGrupos = Array.from(grupos.values());
 
-      // 4) consolida grupo por grupo (chamadas pequenas, sem risco de timeout)
+      // 4) consolida grupo por grupo, também em paralelo com retry
+      setProgresso({ feitos: 0, total: listaGrupos.length, etapa: "consolidando" });
+      const consolidados = await rodarEmParalelo(
+        listaGrupos,
+        (grupo, i) => chamarComRetry(
+          "/api/book-consolidar",
+          { analises: grupo, checklist: BOOK_CHECKLIST, condicionais: BOOK_CONDICIONAIS, competencia },
+          `Consolidação (lote ${i + 1})`
+        ),
+        (feitos) => setProgresso({ feitos, total: listaGrupos.length, etapa: "consolidando" })
+      );
+
       const terceirizadasFinal = [];
       const resumos = [];
       let competenciaDetectada = null;
-      for (let i = 0; i < listaGrupos.length; i++) {
-        setProgresso({ feitos: i, total: listaGrupos.length, etapa: "consolidando" });
-        const respC = await fetch("/api/book-consolidar", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ analises: listaGrupos[i], checklist: BOOK_CHECKLIST, condicionais: BOOK_CONDICIONAIS, competencia }),
-        });
-        const rawC = await respC.text();
-        let dataC; try { dataC = JSON.parse(rawC); } catch { throw new Error(`Consolidação inválida (lote ${i + 1}): ${rawC.slice(0, 120)}`); }
-        if (!respC.ok) throw new Error(`Erro na consolidação (lote ${i + 1}): ${dataC.error || respC.status}`);
+      for (const dataC of consolidados) {
         if (dataC.competencia_detectada && !competenciaDetectada) competenciaDetectada = dataC.competencia_detectada;
         if (dataC.resumo_geral) resumos.push(dataC.resumo_geral);
         (dataC.terceirizadas || []).forEach((t) => terceirizadasFinal.push(t));
@@ -192,7 +234,7 @@ export default function TelaBook() {
         {progresso && (
           <div className="prog">
             <div className="prog-bar"><div className="prog-fill" style={{ width: `${Math.round((progresso.feitos / progresso.total) * 100)}%` }} /></div>
-            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? `Consolidando lote ${progresso.feitos + 1} de ${progresso.total}…` : `Analisando parte ${progresso.feitos + 1} de ${progresso.total}…`}</span>
+            <span>{progresso.etapa === "preparando" ? "Preparando arquivos (dividindo PDFs grandes)…" : progresso.etapa === "consolidando" ? `Consolidando ${progresso.feitos} de ${progresso.total} lote(s)…` : `Analisadas ${progresso.feitos} de ${progresso.total} partes (${LOTE_PARALELO} ao mesmo tempo)…`}</span>
           </div>
         )}
         {erro && <div className="erro">{erro}</div>}
