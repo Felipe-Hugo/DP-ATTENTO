@@ -1,5 +1,8 @@
 // api/book-consolidar.js — consolida as análises e monta o checklist por terceirizada na ordem do book.
+// Com memória: consulta o histórico de conferências anteriores da terceirizada e sinaliza reincidências.
 export const config = { maxDuration: 300 };
+
+import { getSupabase, normalizarCNPJ } from "./_supabase.js";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido" });
@@ -12,6 +15,33 @@ export default async function handler(req, res) {
 
     const lista = checklist.map((c) => `${c.ordem}. ${c.label}`).join("\n");
 
+    // ---------- Memória: busca histórico desta terceirizada, se houver ----------
+    const supabase = getSupabase();
+    let historicoTexto = "";
+    let cnpjGrupo = null;
+    if (supabase) {
+      const comCnpj = analises.find((a) => a.terceirizada?.cnpj);
+      cnpjGrupo = comCnpj ? normalizarCNPJ(comCnpj.terceirizada.cnpj) : null;
+      if (cnpjGrupo) {
+        try {
+          const { data: hist } = await supabase
+            .from("terceirizadas_historico")
+            .select("competencia,score,pendencias,criado_em")
+            .eq("cnpj", cnpjGrupo)
+            .order("criado_em", { ascending: false })
+            .limit(3);
+          if (hist && hist.length) {
+            historicoTexto = `\n\nHISTÓRICO DESTA TERCEIRIZADA (conferências anteriores, mais recente primeiro):\n` +
+              hist.map((h) => `- ${h.competencia || "competência não informada"}: score ${h.score ?? "?"}, pendências: ${(h.pendencias || []).join("; ") || "nenhuma"}`).join("\n") +
+              `\nSe alguma pendência atual JÁ aparece no histórico acima, marque como "reincidência" no texto da pendência.`;
+          }
+        } catch (e) {
+          console.error("Supabase (book-consolidar) leitura falhou:", e);
+        }
+      }
+    }
+    // ------------------------------------------------------------------------
+
     const instrucoes = `Você é um analista de DP da Attento consolidando a conferência do BOOK DE TERCEIRIZADAS. Abaixo, os resultados da análise individual de cada PDF do book.${competencia ? ` Competência: ${competencia}.` : ""}
 
 RESULTADOS INDIVIDUAIS (JSON):
@@ -21,6 +51,7 @@ LISTA PADRÃO DO BOOK (ordem cronológica obrigatória):
 ${lista}
 
 Documentos condicionais (ordens ${condicionais.join(", ")}): só exigidos se houve o evento na competência; ausência sem evento = "nao_aplicavel", não "critico".
+${historicoTexto}
 
 Agrupe por terceirizada e, para CADA UMA, monte o checklist com TODOS os itens da lista padrão, na ordem, marcando o status de cada um:
 - "ok" presente e consistente
@@ -53,6 +84,31 @@ Score 0 a 100 (peso maior para itens críticos/ausentes obrigatórios). O checkl
     const data = await r.json();
     const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").replace(/```json|```/g, "").trim();
     let parsed; try { parsed = JSON.parse(texto); } catch { return res.status(502).json({ error: "Consolidação não-JSON", bruto: texto }); }
+
+    // ---------- Memória: grava esta conferência no histórico ----------
+    if (supabase) {
+      try {
+        for (const t of parsed.terceirizadas || []) {
+          const cnpjNorm = normalizarCNPJ(t.cnpj);
+          if (!cnpjNorm) continue;
+          await supabase.from("terceirizadas_historico").insert({
+            cnpj: cnpjNorm,
+            nome: t.nome || null,
+            competencia: competencia || parsed.competencia_detectada || null,
+            score: t.score ?? null,
+            pendencias: t.pendencias || [],
+          });
+          const { data: existente } = await supabase.from("empresas").select("cnpj").eq("cnpj", cnpjNorm).maybeSingle();
+          if (!existente) {
+            await supabase.from("empresas").insert({ cnpj: cnpjNorm, nome: t.nome || null, atualizado_em: new Date().toISOString() });
+          }
+        }
+      } catch (e) {
+        console.error("Supabase (book-consolidar) escrita falhou:", e);
+      }
+    }
+    // -------------------------------------------------------------------
+
     return res.status(200).json(parsed);
   } catch (e) {
     return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
