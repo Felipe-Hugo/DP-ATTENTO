@@ -58,7 +58,7 @@ function bytesToBase64(bytes) {
 const ehPDF = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name || "");
 const brl = (n) => (typeof n === "number" ? n : parseFloat(n) || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-export default function TelaNotas() {
+export default function TelaNotas({ usuario }) {
   const [notas, setNotas] = useState([]);
   const [condominio, setCondominio] = useState("");
   const [pularTriagem, setPularTriagem] = useState(false);
@@ -173,6 +173,18 @@ export default function TelaNotas() {
       }
 
       setResultado({ condominio, itens, avisos, partesTotal: totalPartes, blocosNF: totalBlocos, paginasNF, paginasDescartadas });
+
+      const totalRetidoGeral = itens.reduce((s, it) => s + (it.total_retido || 0), 0);
+      fetch("/api/log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tipo: "notas",
+          condominio: condominio.trim() || "(não informado)",
+          usuario,
+          resumo: `${itens.length} nota(s) — total retido R$ ${totalRetidoGeral.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`,
+        }),
+      }).catch(() => {});
     } catch (e) {
       setErro(String(e.message || e));
     } finally {
