@@ -1,6 +1,8 @@
 // api/book-analisar.js — analisa UM PDF do book, identifica terceirizada e classifica os documentos contidos.
 export const config = { maxDuration: 300 };
 
+import { getSupabase, normalizarCNPJ } from "./_supabase.js";
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido" });
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -48,13 +50,28 @@ Inclua em itens_presentes apenas os documentos que você localizou neste PDF (co
     const texto = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").replace(/```json|```/g, "").trim();
     let parsed; try { parsed = JSON.parse(texto); } catch { return res.status(502).json({ error: "Resposta não-JSON", bruto: texto }); }
     parsed._arquivo = documento.nome;
-    return res.status(200).json(parsed);
-  } catch (e) {
-    return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
-  }
-}      return res.status(502).json({ error: `A IA não retornou JSON. Ela respondeu: ${resumo}` });
+
+    // ---------- Memória de empresas (Supabase) ----------
+    // Aqui só mantemos o nome associado ao CNPJ atualizado (cross-referência com Notas Fiscais).
+    // Não mexe em regime_tributario — isso é assunto exclusivo da tela de Notas.
+    const supabase = getSupabase();
+    if (supabase && parsed.terceirizada?.cnpj) {
+      const cnpjNorm = normalizarCNPJ(parsed.terceirizada.cnpj);
+      if (cnpjNorm) {
+        try {
+          const { data: existente } = await supabase.from("empresas").select("cnpj").eq("cnpj", cnpjNorm).maybeSingle();
+          if (!existente) {
+            await supabase.from("empresas").insert({ cnpj: cnpjNorm, nome: parsed.terceirizada.nome || null, atualizado_em: new Date().toISOString() });
+          } else if (parsed.terceirizada.nome) {
+            await supabase.from("empresas").update({ nome: parsed.terceirizada.nome, atualizado_em: new Date().toISOString() }).eq("cnpj", cnpjNorm);
+          }
+        } catch (e) {
+          console.error("Supabase (book-analisar) falhou, seguindo sem memória:", e);
+        }
+      }
     }
-    parsed._arquivo = documento.nome;
+    // ------------------------------------------------------
+
     return res.status(200).json(parsed);
   } catch (e) {
     return res.status(500).json({ error: "Falha interna", detalhe: String(e) });
