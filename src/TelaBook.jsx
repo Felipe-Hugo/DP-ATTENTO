@@ -4,8 +4,8 @@ import { BOOK_CHECKLIST, BOOK_CONDICIONAIS } from "./checklist.js";
 
 const LIMITE_BYTES = 2 * 1024 * 1024;
 const LIMITE_PAGINAS = 3;
-const LOTE_PARALELO = 4;   // quantas análises rodam ao mesmo tempo
-const TENTATIVAS = 3;      // 1 tentativa + 2 retries por parte
+const LOTE_PARALELO = 4;
+const TENTATIVAS = 3;
 
 const STATUS = {
   ok: { cor: "#1f9d55", bg: "#e6f4ea", ic: "✓", txt: "OK" },
@@ -67,7 +67,6 @@ function bytesToBase64(bytes) {
 
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// chama uma API com até TENTATIVAS tentativas (retry com espera crescente)
 async function chamarComRetry(url, body, rotulo) {
   let ultimoErro = null;
   for (let t = 1; t <= TENTATIVAS; t++) {
@@ -84,13 +83,12 @@ async function chamarComRetry(url, body, rotulo) {
       return data;
     } catch (e) {
       ultimoErro = e;
-      if (t < TENTATIVAS) await espera(1500 * t); // espera 1,5s, depois 3s
+      if (t < TENTATIVAS) await espera(1500 * t);
     }
   }
   throw ultimoErro;
 }
 
-// roda tarefas em paralelo limitado (no máx. LOTE_PARALELO ao mesmo tempo)
 async function rodarEmParalelo(itens, executar, aoTerminarUma) {
   const resultados = new Array(itens.length);
   let proximo = 0;
@@ -108,8 +106,21 @@ async function rodarEmParalelo(itens, executar, aoTerminarUma) {
   return resultados;
 }
 
-export default function TelaBook() {
+async function registrarLog(payload) {
+  try {
+    await fetch("/api/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    // falha no log não deve travar a experiência do usuário
+  }
+}
+
+export default function TelaBook({ usuario }) {
   const [arquivos, setArquivos] = useState([]);
+  const [condominio, setCondominio] = useState("");
   const [competencia, setCompetencia] = useState("");
   const [carregando, setCarregando] = useState(false);
   const [progresso, setProgresso] = useState(null);
@@ -124,10 +135,10 @@ export default function TelaBook() {
 
   async function conferir() {
     setErro(null); setResultado(null);
+    if (!condominio.trim()) { setErro("Informe o condomínio antes de conferir."); return; }
     if (arquivos.length === 0) { setErro("Adicione pelo menos um PDF."); return; }
     setCarregando(true);
     try {
-      // 1) prepara: divide qualquer PDF grande em partes menores
       setProgresso({ feitos: 0, total: arquivos.length, etapa: "preparando" });
       const partes = [];
       for (const f of arquivos) {
@@ -135,7 +146,6 @@ export default function TelaBook() {
         partes.push(...ps);
       }
 
-      // 2) analisa em paralelo (LOTE_PARALELO por vez), com retry por parte
       const total = partes.length;
       setProgresso({ feitos: 0, total, etapa: "analisando" });
       const analises = await rodarEmParalelo(
@@ -153,7 +163,6 @@ export default function TelaBook() {
         (feitos) => setProgresso({ feitos, total, etapa: "analisando" })
       );
 
-      // 3) agrupa as análises por terceirizada (cnpj, ou nome se não tiver cnpj)
       const grupos = new Map();
       for (const a of analises) {
         const chave = (a.terceirizada?.cnpj || a.terceirizada?.nome || "desconhecida").trim().toUpperCase();
@@ -162,7 +171,6 @@ export default function TelaBook() {
       }
       const listaGrupos = Array.from(grupos.values());
 
-      // 4) consolida grupo por grupo, também em paralelo com retry
       setProgresso({ feitos: 0, total: listaGrupos.length, etapa: "consolidando" });
       const consolidados = await rodarEmParalelo(
         listaGrupos,
@@ -188,6 +196,16 @@ export default function TelaBook() {
         terceirizadas: terceirizadasFinal,
         resumo_geral: resumos.join(" "),
       });
+
+      const scoreMedio = terceirizadasFinal.length
+        ? Math.round(terceirizadasFinal.reduce((s, t) => s + (t.score || 0), 0) / terceirizadasFinal.length)
+        : null;
+      registrarLog({
+        tipo: "book",
+        condominio: condominio.trim(),
+        usuario,
+        resumo: `${terceirizadasFinal.length} terceirizada(s)${scoreMedio != null ? ` — score médio ${scoreMedio}` : ""}`,
+      });
     } catch (e) {
       setErro(String(e.message || e));
     } finally {
@@ -199,6 +217,12 @@ export default function TelaBook() {
     <>
       <h2 className="tela-titulo">Conferência de Book de Terceirizadas</h2>
       <section className="card">
+        <label className="campo">
+          Condomínio
+          <input type="text" placeholder="Nome do condomínio" value={condominio}
+            onChange={(e) => setCondominio(e.target.value)} />
+        </label>
+
         <label className="campo">
           Competência de referência
           <input type="text" placeholder="MM/AAAA (opcional)" value={competencia}
